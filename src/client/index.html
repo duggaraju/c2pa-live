@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>C2PA Live Player</title>
+  <style>
+    :root {
+      --bg: #0f1a20;
+      --panel: #15262f;
+      --ink: #ecf5f7;
+      --muted: #9db7bf;
+      --accent: #1ec8a5;
+      --warn: #f5b841;
+      --bad: #f06b6b;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 700px at 10% -20%, #204755 0%, transparent 60%),
+        radial-gradient(1200px 700px at 110% 120%, #13373f 0%, transparent 55%),
+        var(--bg);
+      min-height: 100vh;
+    }
+
+    .wrap {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(1.3rem, 2vw, 2rem);
+      letter-spacing: 0.02em;
+    }
+
+    .panel {
+      background: color-mix(in oklab, var(--panel), black 10%);
+      border: 1px solid color-mix(in oklab, var(--accent), transparent 75%);
+      border-radius: 14px;
+      padding: 14px;
+      margin-bottom: 16px;
+      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.25);
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr auto auto auto;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    input, button {
+      border-radius: 10px;
+      border: 1px solid #2c4450;
+      background: #102028;
+      color: var(--ink);
+      padding: 10px 12px;
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+      background: color-mix(in oklab, var(--accent), #102028 70%);
+      border-color: color-mix(in oklab, var(--accent), #2c4450 50%);
+      font-weight: 600;
+    }
+
+    video {
+      width: 100%;
+      border-radius: 10px;
+      background: #000;
+      aspect-ratio: 16/9;
+    }
+
+    .meta {
+      margin-top: 12px;
+      display: grid;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .state {
+      font-weight: 700;
+      color: var(--warn);
+    }
+
+    .state.ok { color: var(--accent); }
+    .state.bad { color: var(--bad); }
+
+    pre {
+      margin: 0;
+      max-height: 220px;
+      overflow: auto;
+      padding: 10px;
+      border-radius: 10px;
+      background: #0d1920;
+      border: 1px solid #213742;
+      color: #c3d7de;
+      font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.82rem;
+    }
+  </style>
+  <script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+</head>
+<body>
+  <main class="wrap">
+    <h1>C2PA Live DASH Player</h1>
+
+    <section class="panel">
+      <div class="controls">
+        <input id="manifest" type="text" value="/signed/manifest.mpd" aria-label="Manifest URL" />
+        <button id="playBtn">Play</button>
+        <button id="c2paBtn" disabled>Validate with c2pa-js</button>
+      </div>
+      <video id="video" controls autoplay muted playsinline></video>
+      <div class="meta">
+        <div>Verification: <span id="state" class="state">pending</span></div>
+        <div>Fragment: <span id="fragment">n/a</span></div>
+        <div>c2pa-js: <span id="c2paState" class="state">idle</span></div>
+        <pre id="details">No verification yet</pre>
+        <pre id="c2paDetails">No c2pa-js validation yet</pre>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="./script.js"></script>
+</body>
+</html>

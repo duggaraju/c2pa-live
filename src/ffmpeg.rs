@@ -1,0 +1,183 @@
+use std::io::{BufRead, BufReader};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use clap::Args;
+use essi_ffmpeg::{FFmpeg, FFmpegCommand};
+
+const DASH_ADAPTATION_SETS: &str = "id=0,streams=v id=1,streams=a";
+const DASH_MAP_VIDEO: &str = "0:v:0";
+const DASH_MAP_AUDIO: &str = "0:a:0";
+const DASH_INIT_SEGMENT_NAME: &str = "init-$RepresentationID$.mp4";
+const DASH_MEDIA_SEGMENT_NAME: &str = "chunk-$RepresentationID$-$Number%05d$.m4s";
+const DASH_STREAMING_MODE: &str = "0";
+const DASH_LDASH_MODE: &str = "0";
+const DASH_FRAG_TYPE: &str = "none";
+const DASH_REMOVE_AT_EXIT: &str = "0";
+const LIVE_PUBLISH_PREFIX: &str = "live";
+
+#[derive(Debug, Args, Clone)]
+#[command(next_help_heading = "FFmpeg")]
+pub(crate) struct FfmpegArgs {
+    #[arg(short = 'i', long)]
+    pub input: PathBuf,
+
+    #[arg(long, default_value_t = 2.0)]
+    segment_duration: f32,
+
+    #[arg(long, default_value = "libx264")]
+    video_codec: String,
+
+    #[arg(long, default_value = "aac")]
+    audio_codec: String,
+
+    #[arg(long)]
+    hwaccel: Option<String>,
+
+    #[arg(long)]
+    hwaccel_device: Option<String>,
+
+    #[arg(long)]
+    hwaccel_output_format: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    no_loop: bool,
+}
+
+impl FfmpegArgs {
+    pub fn start_ffmpeg_live(&self, listen: SocketAddr) -> Result<FFmpegCommand> {
+        let output_url = format!("http://{}/{}/manifest.mpd", listen, LIVE_PUBLISH_PREFIX);
+
+        println!("starting ffmpeg live publish to {output_url}");
+
+        let input_path = self
+            .input
+            .to_str()
+            .context("Input path contains invalid UTF-8")?;
+
+        let mut args = vec!["-hide_banner".to_string(), "-re".to_string()];
+
+        if let Some(hwaccel) = &self.hwaccel {
+            args.push("-hwaccel".to_string());
+            args.push(hwaccel.clone());
+        }
+        if let Some(hwaccel_device) = &self.hwaccel_device {
+            args.push("-hwaccel_device".to_string());
+            args.push(hwaccel_device.clone());
+        }
+        if let Some(hwaccel_output_format) = &self.hwaccel_output_format {
+            args.push("-hwaccel_output_format".to_string());
+            args.push(hwaccel_output_format.clone());
+        }
+
+        if !self.no_loop {
+            args.push("-stream_loop".to_string());
+            args.push("-1".to_string());
+        }
+
+        args.extend([
+            "-i".to_string(),
+            input_path.to_string(),
+            "-map".to_string(),
+            DASH_MAP_VIDEO.to_string(),
+            "-c:v".to_string(),
+            self.video_codec.clone(),
+            "-map".to_string(),
+            DASH_MAP_AUDIO.to_string(),
+            "-c:a".to_string(),
+            self.audio_codec.clone(),
+            "-g".to_string(),
+            "60".to_string(),
+            "-keyint_min".to_string(),
+            "60".to_string(),
+            "-sc_threshold".to_string(),
+            "0".to_string(),
+            "-bf".to_string(),
+            "0".to_string(),
+            "-force_key_frames".to_string(),
+            "expr:gte(t,n_forced*2)".to_string(),
+            "-f".to_string(),
+            "dash".to_string(),
+            "-streaming".to_string(),
+            DASH_STREAMING_MODE.to_string(),
+            "-ldash".to_string(),
+            DASH_LDASH_MODE.to_string(),
+            "-frag_type".to_string(),
+            DASH_FRAG_TYPE.to_string(),
+            "-hls_playlist".to_string(),
+            "1".to_string(),
+            "-use_template".to_string(),
+            "1".to_string(),
+            "-use_timeline".to_string(),
+            "0".to_string(),
+            "-window_size".to_string(),
+            "5".to_string(),
+            "-extra_window_size".to_string(),
+            "10".to_string(),
+            "-seg_duration".to_string(),
+            self.segment_duration.to_string(),
+            "-frag_duration".to_string(),
+            self.segment_duration.to_string(),
+            "-adaptation_sets".to_string(),
+            DASH_ADAPTATION_SETS.to_string(),
+            "-init_seg_name".to_string(),
+            DASH_INIT_SEGMENT_NAME.to_string(),
+            "-media_seg_name".to_string(),
+            DASH_MEDIA_SEGMENT_NAME.to_string(),
+            "-remove_at_exit".to_string(),
+            DASH_REMOVE_AT_EXIT.to_string(),
+            "-hls_segment_type".to_string(),
+            "fmp4".to_string(),
+            "-method".to_string(),
+            "PUT".to_string(),
+            "-http_persistent".to_string(),
+            "0".to_string(),
+            "-ignore_io_errors".to_string(),
+            "1".to_string(),
+            output_url,
+        ]);
+
+        println!("ffmpeg command: ffmpeg {}", args.join(" "));
+
+        let mut ffmpeg = FFmpeg::new_with_program("ffmpeg")
+            .args(args)
+            .start()
+            .with_context(|| "Failed to start ffmpeg process")?;
+
+        attach_ffmpeg_loggers(&mut ffmpeg);
+        Ok(ffmpeg)
+    }
+}
+
+fn attach_ffmpeg_loggers(ffmpeg: &mut FFmpegCommand) {
+    if let Some(stdout) = ffmpeg.take_stdout() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => println!("[ffmpeg][stdout] {line}"),
+                    Err(err) => {
+                        eprintln!("[ffmpeg][stdout] read error: {err}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    if let Some(stderr) = ffmpeg.take_stderr() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => eprintln!("[ffmpeg][stderr] {line}"),
+                    Err(err) => {
+                        eprintln!("[ffmpeg][stderr] read error: {err}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}

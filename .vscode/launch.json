@@ -1,0 +1,38 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug executable 'c2pa-live'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=c2pa-live"
+                ]
+            },
+            "args": [
+                "--input", "media/bbb_sunflower_1080p_30fps_normal.mp4",
+                "--hwaccel", "cuda", "--video-codec", "h264_nvenc",
+                "--cert", "../c2pa-rs/sdk/tests/fixtures/certs/es256.pub",
+                "--key", "../c2pa-rs/sdk/tests/fixtures/certs/es256.pem",
+                "--no-cache",
+                "--trust-anchors", "../c2pa-rs/sdk/tests/fixtures/certs/trust/test_cert_root_bundle.pem"
+            ]
+        },
+        {
+            "name": "Debug unit tests in executable 'c2pa-live'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=c2pa-live"
+                ]
+            }
+        }
+    ]
+}

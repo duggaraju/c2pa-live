@@ -1,0 +1,10 @@
+[verify]
+verify_after_sign = false
+verify_after_sign_hash = false
+verify_trust = false
+
+[trust]
+# Path to PEM bundle containing trusted root/intermediate certificates.
+# Update this to your environment if you want trust verification to succeed.
+# Example:
+# trust_anchors = "/home/user/certs/test_cert_root_bundle.pem"
