@@ -23,8 +23,9 @@ pub(crate) struct FfmpegArgs {
     #[arg(short = 'i', long)]
     pub input: PathBuf,
 
-    #[arg(long, default_value_t = 2.0)]
-    segment_duration: f32,
+    #[arg(long, default_value_t = 1.0, value_parser = parse_positive_duration,
+        help = "Segment duration in seconds; shorter segments lower latency but require more session signatures")]
+    pub segment_duration: f64,
 
     #[arg(long, default_value = "libx264")]
     video_codec: String,
@@ -46,7 +47,7 @@ pub(crate) struct FfmpegArgs {
 }
 
 impl FfmpegArgs {
-    pub fn start_ffmpeg_live(&self, listen: SocketAddr) -> Result<FFmpegCommand> {
+    fn command_args(&self, listen: SocketAddr) -> Result<Vec<String>> {
         let output_url = format!("http://{}/{}/manifest.mpd", listen, LIVE_PUBLISH_PREFIX);
 
         println!("starting ffmpeg live publish to {output_url}");
@@ -87,16 +88,16 @@ impl FfmpegArgs {
             DASH_MAP_AUDIO.to_string(),
             "-c:a".to_string(),
             self.audio_codec.clone(),
-            "-g".to_string(),
-            "60".to_string(),
-            "-keyint_min".to_string(),
-            "60".to_string(),
             "-sc_threshold".to_string(),
             "0".to_string(),
             "-bf".to_string(),
             "0".to_string(),
             "-force_key_frames".to_string(),
-            "expr:gte(t,n_forced*2)".to_string(),
+            // An absolute time grid can create short GOPs that DASH merges into longer segments.
+            format!(
+                "expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+{}-0.000001))",
+                self.segment_duration
+            ),
             "-f".to_string(),
             "dash".to_string(),
             "-streaming".to_string(),
@@ -110,7 +111,9 @@ impl FfmpegArgs {
             "-use_template".to_string(),
             "1".to_string(),
             "-use_timeline".to_string(),
-            "0".to_string(),
+            "1".to_string(),
+            "-update_period".to_string(),
+            "1".to_string(),
             "-window_size".to_string(),
             "5".to_string(),
             "-extra_window_size".to_string(),
@@ -133,11 +136,26 @@ impl FfmpegArgs {
             "PUT".to_string(),
             "-http_persistent".to_string(),
             "0".to_string(),
-            "-ignore_io_errors".to_string(),
-            "1".to_string(),
             output_url,
         ]);
 
+        if self.video_codec == "libx264" {
+            let output_position = args.len() - 1;
+            args.splice(
+                output_position..output_position,
+                [
+                    "-preset".into(),
+                    "veryfast".into(),
+                    "-tune".into(),
+                    "zerolatency".into(),
+                ],
+            );
+        }
+        Ok(args)
+    }
+
+    pub fn start_ffmpeg_live(&self, listen: SocketAddr) -> Result<FFmpegCommand> {
+        let args = self.command_args(listen)?;
         println!("ffmpeg command: ffmpeg {}", args.join(" "));
 
         let mut ffmpeg = FFmpeg::new_with_program("ffmpeg")
@@ -148,6 +166,16 @@ impl FfmpegArgs {
         attach_ffmpeg_loggers(&mut ffmpeg);
         Ok(ffmpeg)
     }
+}
+
+pub(crate) fn parse_positive_duration(value: &str) -> std::result::Result<f64, String> {
+    let duration: f64 = value
+        .parse()
+        .map_err(|_| "Expected a positive finite duration".to_string())?;
+    if !duration.is_finite() || duration <= 0.0 {
+        return Err("Duration must be positive and finite".into());
+    }
+    Ok(duration)
 }
 
 fn attach_ffmpeg_loggers(ffmpeg: &mut FFmpegCommand) {
@@ -179,5 +207,44 @@ fn attach_ffmpeg_loggers(ffmpeg: &mut FFmpegCommand) {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn short_segments_control_keyframes_without_fixed_two_second_gop() -> Result<()> {
+        let cli = crate::Cli::try_parse_from([
+            "c2pa-live",
+            "--input",
+            "input.mp4",
+            "--cert",
+            "cert.pem",
+            "--key",
+            "key.pem",
+            "--segment-duration",
+            "0.25",
+        ])?;
+        let args = cli.ffmpeg.command_args("127.0.0.1:8080".parse()?)?;
+        assert!(args.windows(2).any(|p| p
+            == [
+                "-force_key_frames",
+                "expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+0.25-0.000001))"
+            ]));
+        assert!(args.windows(2).any(|p| p == ["-seg_duration", "0.25"]));
+        assert!(args.windows(2).any(|p| p == ["-use_timeline", "1"]));
+        assert!(args.windows(2).any(|p| p == ["-update_period", "1"]));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "-g" || a == "-keyint_min" || a == "-ignore_io_errors")
+        );
+        let input = args.iter().position(|a| a == "-i").unwrap();
+        let tune = args.iter().position(|a| a == "-tune").unwrap();
+        assert!(tune > input && tune < args.len() - 1);
+        Ok(())
     }
 }

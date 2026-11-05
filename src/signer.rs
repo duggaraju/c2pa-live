@@ -1,348 +1,256 @@
+use std::collections::HashMap;
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
-use c2pa::Builder;
+use anyhow::{Context, Result, ensure};
+use c2pa::{Builder, Reader};
+use c2pa_cbor::Value;
+use chrono::Utc;
+use sha2::{Digest, Sha256};
 
-use crate::{
-    SIGNING_FRAGMENT_FILE_PREFIX, SIGNING_FRAGMENT_FILE_SUFFIX, SIGNING_INIT_SEGMENT_PREFIX,
-    representation_id_from_filename,
-};
+use crate::live_emsg::{self, TrackTiming};
+use crate::live_signing::{SessionKey, map, text};
+use crate::{SIGNING_INIT_SEGMENT_PREFIX, representation_id_from_filename};
+
+static PUBLICATION_ID: AtomicU64 = AtomicU64::new(0);
+
+struct TrackState {
+    init: Vec<u8>,
+    timing: TrackTiming,
+    session: SessionKey,
+    manifest_id: String,
+    manifest_uri: Value,
+    last_sequence: Option<u32>,
+}
 
 pub(crate) struct FragmentSigner {
     context: Arc<c2pa::Context>,
-    claim_generator: String,
     pub(crate) signed_root: PathBuf,
+    validity_secs: u32,
+    overlap_secs: u32,
+    public_origin: String,
+    tracks: Mutex<HashMap<PathBuf, Arc<Mutex<Option<TrackState>>>>>,
+    event_id: AtomicU64,
 }
 
 impl FragmentSigner {
     pub(crate) fn new(
         context: Arc<c2pa::Context>,
         signed_root: PathBuf,
-        claim_generator: String,
-    ) -> Self {
-        Self {
+        validity_secs: u32,
+        overlap_secs: u32,
+        public_origin: String,
+    ) -> Result<Self> {
+        ensure!(
+            validity_secs > 0 && overlap_secs > 0 && overlap_secs < validity_secs,
+            "Session key overlap must be positive and less than validity"
+        );
+        Ok(Self {
             context,
             signed_root,
-            claim_generator,
-        }
-    }
-
-    pub(crate) fn maybe_sign_uploaded_fragment(
-        &self,
-        storage_root: &Path,
-        uploaded_file: &Path,
-    ) -> Result<()> {
-        let ext = uploaded_file
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-
-        if ext != "m4s" {
-            return Ok(());
-        }
-
-        let parent = uploaded_file
-            .parent()
-            .context("Uploaded fragment has no parent directory")?;
-        let Some(file_name) = uploaded_file.file_name().and_then(|s| s.to_str()) else {
-            return Ok(());
-        };
-
-        if !file_name.starts_with(SIGNING_FRAGMENT_FILE_PREFIX)
-            || !file_name.ends_with(SIGNING_FRAGMENT_FILE_SUFFIX)
-        {
-            return Ok(());
-        }
-
-        let Some(rep_id) = representation_id_from_filename(file_name) else {
-            return Ok(());
-        };
-
-        let init_segment = self.find_init_segment(parent, rep_id)?;
-
-        let Some(init_segment) = init_segment else {
-            return Ok(());
-        };
-
-        let current_dir =
-            std::env::current_dir().with_context(|| "Failed to get current working directory")?;
-        let abs_parent = if parent.is_absolute() {
-            parent.to_path_buf()
-        } else {
-            current_dir.join(parent)
-        };
-
-        let abs_init_segment = if init_segment.is_absolute() {
-            init_segment.clone()
-        } else {
-            current_dir.join(&init_segment)
-        };
-        let abs_uploaded_fragment = abs_parent.join(file_name);
-        if !abs_uploaded_fragment.is_file() {
-            return Ok(());
-        }
-
-        let mut source_fragments: Vec<PathBuf> = Vec::new();
-        for entry in fs::read_dir(&abs_parent)
-            .with_context(|| format!("Failed to read source directory {}", abs_parent.display()))?
-        {
-            let entry = entry
-                .with_context(|| format!("Failed to read entry in {}", abs_parent.display()))?;
-            let candidate = entry.path();
-            if !candidate.is_file() {
-                continue;
-            }
-
-            let Some(candidate_name) = candidate.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-
-            if !candidate_name.starts_with(&format!("{}{}-", SIGNING_FRAGMENT_FILE_PREFIX, rep_id))
-                || !candidate_name.ends_with(SIGNING_FRAGMENT_FILE_SUFFIX)
-            {
-                continue;
-            }
-
-            source_fragments.push(candidate);
-        }
-
-        if source_fragments.is_empty() {
-            return Ok(());
-        }
-
-        let stage_nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let stage_dir = abs_parent.join(format!(".c2pa-stage-{stage_nonce}"));
-        fs::create_dir_all(&stage_dir)
-            .with_context(|| format!("Failed to create C2PA stage dir {}", stage_dir.display()))?;
-
-        let staged_init = stage_dir.join(format!("{}{}.mp4", SIGNING_INIT_SEGMENT_PREFIX, rep_id));
-        fs::copy(&abs_init_segment, &staged_init).with_context(|| {
-            format!(
-                "Failed to copy init segment {} to {}",
-                abs_init_segment.display(),
-                staged_init.display()
-            )
-        })?;
-
-        for source_fragment in &source_fragments {
-            let staged_fragment = stage_dir.join(
-                source_fragment
-                    .file_name()
-                    .context("Source fragment missing file name")?,
-            );
-            fs::copy(source_fragment, &staged_fragment).with_context(|| {
-                format!(
-                    "Failed to copy fragment {} to {}",
-                    source_fragment.display(),
-                    staged_fragment.display()
-                )
-            })?;
-        }
-
-        let fragment_input = stage_dir.join(format!("chunk-{}-*.m4s", rep_id));
-        let relative_parent = parent.strip_prefix(storage_root).unwrap_or(parent);
-        let sign_output_dir = self.signed_root.join(relative_parent);
-        fs::create_dir_all(&sign_output_dir).with_context(|| {
-            format!(
-                "Failed to create signed output dir {}",
-                sign_output_dir.display()
-            )
-        })?;
-
-        self.copy_auxiliary_playback_files(parent, &sign_output_dir)
-            .with_context(|| {
-                format!(
-                    "Failed to copy auxiliary playback files from {} to {}",
-                    parent.display(),
-                    sign_output_dir.display()
-                )
-            })?;
-
-        let mut builder = Builder::from_shared_context(&self.context)
-            .with_definition(Self::manifest_definition(&self.claim_generator))
-            .with_context(|| "Failed to construct C2PA builder")?;
-
-        let signing_result = builder
-            .sign_fragmented_files(
-                self.context.signer()?,
-                &staged_init,
-                &fragment_input,
-                &sign_output_dir,
-            )
-            .with_context(|| {
-                format!(
-                    "Failed C2PA signing for init={} fragments={} output={}",
-                    staged_init.display(),
-                    fragment_input.display(),
-                    sign_output_dir.display()
-                )
-            });
-
-        let _ = fs::remove_dir_all(&stage_dir);
-        signing_result?;
-
-        let stage_folder_name = stage_dir
-            .file_name()
-            .context("Failed to determine stage folder name")?;
-        self.promote_signed_outputs(&sign_output_dir, stage_folder_name)
-            .with_context(|| {
-                format!(
-                    "Failed to promote signed files from nested folder for {}",
-                    sign_output_dir.display()
-                )
-            })?;
-
-        println!(
-            "fragment signed: {} -> {}",
-            abs_uploaded_fragment.display(),
-            sign_output_dir.join(file_name).display()
-        );
-
-        Ok(())
-    }
-
-    fn copy_auxiliary_playback_files(&self, source_dir: &Path, target_dir: &Path) -> Result<()> {
-        for entry in fs::read_dir(source_dir)
-            .with_context(|| format!("Failed to read source directory {}", source_dir.display()))?
-        {
-            let entry = entry
-                .with_context(|| format!("Failed to read entry in {}", source_dir.display()))?;
-            let path = entry.path();
-
-            if !path.is_file() {
-                continue;
-            }
-
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if ext != "m3u8" && ext != "mpd" {
-                continue;
-            }
-
-            let destination = target_dir.join(name);
-            fs::copy(&path, &destination).with_context(|| {
-                format!(
-                    "Failed to copy auxiliary file {} to {}",
-                    path.display(),
-                    destination.display()
-                )
-            })?;
-        }
-
-        Ok(())
-    }
-
-    fn find_init_segment(&self, dir: &Path, rep_id: &str) -> Result<Option<PathBuf>> {
-        let init_segment = dir.join(format!("{}{}.mp4", SIGNING_INIT_SEGMENT_PREFIX, rep_id));
-        if init_segment.is_file() {
-            if let Some(init_name) = init_segment.file_name().and_then(|s| s.to_str()) {
-                let expected = format!("{}{}.mp4", SIGNING_INIT_SEGMENT_PREFIX, rep_id);
-                if init_name != expected {
-                    return Ok(None);
-                }
-            }
-            return Ok(Some(init_segment));
-        }
-
-        Ok(None)
-    }
-
-    fn promote_signed_outputs(
-        &self,
-        output_root: &Path,
-        nested_dir_name: &std::ffi::OsStr,
-    ) -> Result<()> {
-        let nested_output_dir = output_root.join(nested_dir_name);
-        if !nested_output_dir.is_dir() {
-            return Ok(());
-        }
-
-        for entry in fs::read_dir(&nested_output_dir).with_context(|| {
-            format!(
-                "Failed to read nested output directory {}",
-                nested_output_dir.display()
-            )
-        })? {
-            let entry = entry.with_context(|| {
-                format!(
-                    "Failed to read entry in nested output directory {}",
-                    nested_output_dir.display()
-                )
-            })?;
-            let source = entry.path();
-            if !source.is_file() {
-                continue;
-            }
-
-            let destination = output_root.join(entry.file_name());
-            if destination.exists() {
-                fs::remove_file(&destination).with_context(|| {
-                    format!(
-                        "Failed to remove existing output file {}",
-                        destination.display()
-                    )
-                })?;
-            }
-
-            fs::rename(&source, &destination).with_context(|| {
-                format!(
-                    "Failed to move signed output {} -> {}",
-                    source.display(),
-                    destination.display()
-                )
-            })?;
-        }
-
-        fs::remove_dir_all(&nested_output_dir).with_context(|| {
-            format!(
-                "Failed to remove nested output directory {}",
-                nested_output_dir.display()
-            )
-        })?;
-
-        Ok(())
-    }
-
-    fn manifest_definition(claim_generator: &str) -> String {
-        serde_json::json!({
-            "title": "Live CMAF Fragment",
-            "format": "video/mp4",
-            "claim_generator_info": [
-                {
-                    "name": claim_generator,
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            ],
-            "assertions": [
-                {
-                    "label": "c2pa.actions",
-                    "data": {
-                        "actions": [
-                            {
-                                "action": "c2pa.created",
-                                "softwareAgent": {
-                                    "name": "c2pa-live"
-                                }
-                            }
-                        ]
-                    }
-                }
-            ]
+            validity_secs,
+            overlap_secs,
+            public_origin,
+            tracks: Mutex::new(HashMap::new()),
+            event_id: AtomicU64::new(0),
         })
-        .to_string()
     }
+
+    pub(crate) fn process_upload(&self, storage_root: &Path, uploaded_file: &Path) -> Result<()> {
+        let relative = uploaded_file
+            .strip_prefix(storage_root)
+            .context("Upload is outside storage root")?;
+        let name = relative
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("Invalid upload filename")?;
+        let parent = relative.parent().context("Upload has no parent")?;
+        let output = self.signed_root.join(relative);
+        fs::create_dir_all(output.parent().context("Output has no parent")?)?;
+        let extension = uploaded_file.extension().and_then(|s| s.to_str());
+        if matches!(extension, Some("mpd" | "m3u8")) {
+            return atomic_write(&output, &fs::read(uploaded_file)?);
+        }
+        let init_rep = name
+            .strip_prefix(SIGNING_INIT_SEGMENT_PREFIX)
+            .and_then(|s| s.strip_suffix(".mp4"));
+        let media_rep = representation_id_from_filename(name);
+        let rep = init_rep
+            .or(media_rep)
+            .context("Unsupported live upload filename")?;
+        ensure!(!rep.is_empty(), "Empty representation identifier");
+        let init_relative = parent.join(format!("init-{rep}.mp4"));
+        let track = self
+            .tracks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Track map lock poisoned"))?
+            .entry(init_relative.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone();
+        let mut guard = track
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Track signing lock poisoned"))?;
+        if init_rep.is_some() {
+            let init = fs::read(uploaded_file)?;
+            if let Some(state) = guard.as_ref() {
+                ensure!(
+                    state.init == init,
+                    "Initialization changed; start a new stream path"
+                );
+                return Ok(());
+            }
+            let timing = TrackTiming::from_init(&init)?;
+            let (session, manifest_id, manifest_uri) =
+                self.publish_session(&init, &init_relative, 1)?;
+            *guard = Some(TrackState {
+                init,
+                timing,
+                session,
+                manifest_id,
+                manifest_uri,
+                last_sequence: None,
+            });
+            return Ok(());
+        }
+        let state = guard
+            .as_mut()
+            .context("Media uploaded before initialization segment")?;
+        let mut segment = fs::read(uploaded_file)?;
+        let (sequence, duration) = state.timing.segment(&segment)?;
+        if let Some(previous) = state.last_sequence {
+            ensure!(
+                previous.checked_add(1) == Some(sequence),
+                "Out-of-order, repeated or missing media sequence: {previous} -> {sequence}"
+            );
+        }
+        if state.session.needs_rotation(Utc::now(), self.overlap_secs) {
+            let (session, manifest_id, manifest_uri) =
+                self.publish_session(&state.init, &init_relative, sequence)?;
+            state.session = session;
+            state.manifest_id = manifest_id;
+            state.manifest_uri = manifest_uri;
+        }
+        ensure!(
+            live_emsg::message(&segment)?.is_none(),
+            "Media already contains C2PA emsg"
+        );
+        let message = state.session.sign_segment(
+            &segment,
+            sequence,
+            &state.manifest_id,
+            state.manifest_uri.clone(),
+            Utc::now(),
+        )?;
+        let event_id = u32::try_from(self.event_id.fetch_add(1, Ordering::Relaxed))
+            .context("Session emsg identifiers exhausted; start a new stream")?;
+        segment.extend(live_emsg::encode(
+            &message,
+            state.timing.timescale,
+            duration,
+            event_id,
+        )?);
+        atomic_write(&output, &segment)?;
+        state.last_sequence = Some(sequence);
+        Ok(())
+    }
+
+    fn publish_session(
+        &self,
+        init: &[u8],
+        init_relative: &Path,
+        min_sequence: u32,
+    ) -> Result<(SessionKey, String, Value)> {
+        let session = SessionKey::new(Utc::now(), self.validity_secs, min_sequence)?;
+        let certs = self.context.signer()?.certs()?;
+        let cert = certs
+            .first()
+            .context("Signer has no end-entity certificate")?;
+        let mut builder = Builder::from_shared_context(&self.context).with_definition(serde_json::json!({
+            "title": "Live CMAF session",
+            "claim_generator_info": [{"name": "c2pa-live", "version": env!("CARGO_PKG_VERSION")}],
+            "assertions": [{"label": "c2pa.actions", "data": {"actions": [{
+                "action": "c2pa.created",
+                "digitalSourceType": "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCreation"
+            }]}}]
+        }).to_string())?;
+        builder.add_assertion("c2pa.session-keys", &session.assertion(cert)?)?;
+        let mut signed_init = Cursor::new(Vec::new());
+        let manifest = builder.sign(
+            self.context.signer()?,
+            "video/mp4",
+            &mut Cursor::new(init),
+            &mut signed_init,
+        )?;
+        let signed_init = signed_init.into_inner();
+        let reader = Reader::from_shared_context(&self.context)
+            .with_stream("video/mp4", Cursor::new(&signed_init))?;
+        let manifest_id = reader
+            .active_manifest()
+            .and_then(|m| m.label())
+            .context("Signed init has no manifest identifier")?
+            .to_owned();
+        let suffix: String = session
+            .kid
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let file_name = format!("session-{suffix}");
+        let parent = init_relative
+            .parent()
+            .context("Initialization has no parent")?;
+        let manifest_relative = parent.join(format!("{file_name}.c2pa"));
+        let path = self.signed_root.join(&manifest_relative);
+        atomic_write(&path, &manifest)?;
+        // Retain an immutable signed init so clients can validate the external manifest's
+        // moov binding using SDKs that do not yet expose a live-video reader.
+        atomic_write(
+            &self
+                .signed_root
+                .join(parent)
+                .join(format!("{file_name}.mp4")),
+            &signed_init,
+        )?;
+        atomic_write(&self.signed_root.join(init_relative), &signed_init)?;
+        let uri = format!(
+            "{}/signed/{}",
+            self.public_origin,
+            manifest_relative
+                .to_str()
+                .context("Non-UTF-8 manifest path")?
+        );
+        ensure!(
+            !uri.contains(['?', '#', '%', ' ']),
+            "Stream path must be URL-safe"
+        );
+        let manifest_uri = map([
+            ("url", text(uri)),
+            ("alg", text("sha256")),
+            ("hash", Value::Bytes(Sha256::digest(&manifest).to_vec())),
+        ]);
+        Ok((session, manifest_id, manifest_uri))
+    }
+}
+
+fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<()> {
+    let id = PUBLICATION_ID.fetch_add(1, Ordering::Relaxed);
+    let name = destination
+        .file_name()
+        .context("Publication has no filename")?
+        .to_string_lossy();
+    let temp =
+        destination.with_file_name(format!(".{name}.publishing-{}-{id}", std::process::id()));
+    let result: Result<()> = (|| {
+        fs::write(&temp, bytes)?;
+        fs::rename(&temp, destination)?;
+        Ok(())
+    })();
+    if result.is_err()
+        && let Err(err) = fs::remove_file(&temp)
+    {
+        eprintln!("Failed to clean publication {}: {err}", temp.display());
+    }
+    result.with_context(|| format!("Publishing {}", destination.display()))
 }

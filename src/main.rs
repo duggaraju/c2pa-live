@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use c2pa::crypto::raw_signature::SigningAlg;
-use c2pa::{Context as C2paContext, create_signer};
+use c2pa::{Context as C2paContext, SigningAlg, create_signer};
 use clap::{Args, Parser};
 use tokio::sync::watch;
 
@@ -15,6 +14,8 @@ mod signer;
 use crate::signer::FragmentSigner;
 mod http;
 use crate::http::{AppState, run_server};
+mod live_emsg;
+mod live_signing;
 
 const SIGNING_FRAGMENT_FILE_PREFIX: &str = "chunk-";
 const SIGNING_FRAGMENT_FILE_SUFFIX: &str = ".m4s";
@@ -37,6 +38,13 @@ struct Cli {
     )]
     no_cache: bool,
 
+    #[arg(long, value_parser = ffmpeg::parse_positive_duration, help = "Browser playback delay in seconds (default: three segment durations)")]
+    playback_delay: Option<f64>,
+
+    #[arg(long, value_parser = parse_public_origin,
+        help = "Public HTTP(S) origin for immutable key manifests, e.g. https://stream.example.com (default: http://<listen>)")]
+    public_base_url: Option<String>,
+
     #[command(flatten)]
     ffmpeg: FfmpegArgs,
 
@@ -56,10 +64,10 @@ struct C2paArgs {
     )]
     settings: Option<PathBuf>,
 
-    #[arg(long, short= 'c', help = "C2PA signing certificate in PEM format")]
+    #[arg(long, short = 'c', help = "C2PA signing certificate in PEM format")]
     cert: PathBuf,
 
-    #[arg(long, short= 'k', help = "C2PA signing key in PEM format")]
+    #[arg(long, short = 'k', help = "C2PA signing key in PEM format")]
     key: PathBuf,
 
     #[arg(
@@ -74,6 +82,20 @@ struct C2paArgs {
 
     #[arg(long, value_parser = parse_signing_alg, default_value = "es256")]
     signing_alg: SigningAlg,
+
+    #[arg(
+        long,
+        default_value_t = 300,
+        help = "Session key lifetime in seconds; longer lifetimes reduce certificate/TSA operations"
+    )]
+    session_key_validity_secs: u32,
+
+    #[arg(
+        long,
+        default_value_t = 30,
+        help = "Session key overlap window (seconds) before rollover"
+    )]
+    session_key_overlap_secs: u32,
 }
 
 impl C2paArgs {
@@ -122,7 +144,11 @@ impl C2paArgs {
 fn representation_id_from_filename(file_name: &str) -> Option<&str> {
     let name = file_name.strip_suffix(SIGNING_FRAGMENT_FILE_SUFFIX)?;
     let name = name.strip_prefix(SIGNING_FRAGMENT_FILE_PREFIX)?;
-    name.split('-').next()
+    let (rep, sequence) = name.split_once('-')?;
+    if rep.is_empty() || sequence.parse::<u32>().is_err() {
+        return None;
+    }
+    Some(rep)
 }
 
 #[tokio::main]
@@ -140,18 +166,31 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    let context = cli.c2pa.create_context()?;
+    let storage_root = fs::canonicalize(&cli.storage_dir)?;
+    let signed_root = fs::canonicalize(&cli.c2pa.signed_dir)?;
+    anyhow::ensure!(
+        !storage_root.starts_with(&signed_root) && !signed_root.starts_with(&storage_root),
+        "Storage and signed directories must not overlap"
+    );
 
+    let context = cli.c2pa.create_context()?;
     let signer = Arc::new(FragmentSigner::new(
         Arc::new(context),
-        cli.c2pa.signed_dir.clone(),
-        "c2pa-live".to_string()
-    ));
+        signed_root,
+        cli.c2pa.session_key_validity_secs,
+        cli.c2pa.session_key_overlap_secs,
+        cli.public_base_url
+            .unwrap_or_else(|| format!("http://{}", cli.listen)),
+    )?);
 
     let state = Arc::new(AppState {
-        storage_root: cli.storage_dir.clone(),
+        storage_root,
         signer,
         no_cache: cli.no_cache,
+        segment_duration: cli.ffmpeg.segment_duration,
+        playback_delay: cli
+            .playback_delay
+            .unwrap_or(cli.ffmpeg.segment_duration * 3.0),
         trust_anchors: cli
             .c2pa
             .trust_anchors
@@ -166,9 +205,11 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_state = state.clone();
-    let listen_addr = cli.listen;
+    let listener = tokio::net::TcpListener::bind(cli.listen)
+        .await
+        .with_context(|| format!("Failed to bind HTTP server on {}", cli.listen))?;
     let server_task =
-        tokio::spawn(async move { run_server(listen_addr, server_state, shutdown_rx).await });
+        tokio::spawn(async move { run_server(listener, server_state, shutdown_rx).await });
 
     println!("HTTP ingest server listening on http://{}", cli.listen);
 
@@ -215,3 +256,25 @@ fn parse_signing_alg(value: &str) -> std::result::Result<SigningAlg, String> {
         )),
     }
 }
+
+fn parse_public_origin(value: &str) -> std::result::Result<String, String> {
+    let uri: ::http::Uri = value
+        .parse()
+        .map_err(|_| "Invalid public origin".to_string())?;
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || uri.authority().is_none()
+        || uri.authority().is_some_and(|a| a.as_str().contains('@'))
+        || uri.path() != "/"
+        || uri.query().is_some()
+        || value.contains('#')
+    {
+        return Err(
+            "Public origin must be http(s)://host[:port] without a path, query or credentials"
+                .into(),
+        );
+    }
+    Ok(value.trim_end_matches('/').to_owned())
+}
+
+#[cfg(test)]
+mod tests;
